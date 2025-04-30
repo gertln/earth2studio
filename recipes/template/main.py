@@ -14,4 +14,22 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-__version__ = "0.7.0a0"
+from omegaconf import OmegaConf
+from src.template import print_earth2studio_version, print_hello
+
+
+def main() -> None:
+    """Main function"""
+    cfg_file = OmegaConf.load("cfg/template.yml")
+    cli_conf = OmegaConf.from_cli()
+    cfg = OmegaConf.merge(cfg_file, cli_conf)
+
+    if cfg.print.hello:
+        print_hello()
+
+    if cfg.print.version:
+        print_earth2studio_version()
+
+
+if __name__ == "__main__":
+    main()

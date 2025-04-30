@@ -14,4 +14,14 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-__version__ = "0.7.0a0"
+import earth2studio
+
+
+def print_hello() -> None:
+    """Prints hello"""
+    print("Hello")
+
+
+def print_earth2studio_version() -> None:
+    """Prints Earth2studio package version"""
+    print(earth2studio.__version__)
