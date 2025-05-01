@@ -122,6 +122,46 @@ uv add earth2studio --extra aurora
 :::
 ::::
 :::::
+:::::{tab-item} DLWP
+::::{tab-set}
+:::{tab-item} pip
+
+```bash
+pip install earth2studio[dlwp]
+```
+
+:::
+:::{tab-item} uv
+
+```bash
+uv add earth2studio --extra dlwp
+```
+
+:::
+::::
+:::::
+:::::{tab-item} DLESyM
+Notes: For all DLESyM models, [Earth2Grid](https://github.com/NVlabs/earth2grid) needs to
+be installed manually.
+
+::::{tab-set}
+:::{tab-item} pip
+
+```bash
+pip install --no-build-isolation "earth2grid @ git+https://github.com/NVlabs/earth2grid@aefb10793aa372bae7d0951d627a89e2983fd0ca"
+pip install earth2studio[dlesym]
+```
+
+:::
+:::{tab-item} uv
+
+```bash
+uv add earth2studio --extra dlesym
+```
+
+:::
+::::
+:::::
 :::::{tab-item} FourCastNet
 ::::{tab-set}
 :::{tab-item} pip
@@ -310,7 +350,8 @@ uv add earth2studio --extra corrdiff
 ::::
 :::::
 :::::{tab-item} Cyclone Trackers
-Notes: Additional dependencies for all cyclone tracking models.
+Notes: Additional dependencies for all cyclone tracking models. Only Python 3.12 and
+below support.
 
 ::::{tab-set}
 :::{tab-item} uv
@@ -487,6 +528,7 @@ To install a best effort all optional dependencies group, use the following:
 :::{tab-item} uv
 
 ```bash
+uv sync
 uv add earth2studio --extra all
 ```
 
