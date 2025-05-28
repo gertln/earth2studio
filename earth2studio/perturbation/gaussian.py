@@ -185,8 +185,9 @@ class CorrelatedSphericalField(torch.nn.Module):
     nlat : int
         Number of latitudinal modes;
         longitudinal modes are 2*nlat.
-    length_scale : int
-        Length scale in m
+    length_scale : float
+        Correlation length scale in meters that determines the spatial decorrelation
+        distance of the noise field on the sphere
     time_scale : int
         Time scale in hours for the AR(1) process, that governs
         the evolution of the coefficients
