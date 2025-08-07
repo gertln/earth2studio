@@ -1,0 +1,347 @@
+#!/usr/bin/env python
+"""examples/assess_bias.py
+
+Run bias-assessment inference in *parallel* across multiple GPUs.
+Launch with e.g.:
+    torchrun --standalone --nnodes 1 --nproc_per_node 2 examples/assess_bias.py
+Each rank (GPU) gets its own shard of the initial times and writes its
+results to ``bias_rank{rank}.pt``.  Post-processing can simply
+``torch.load`` the files and concatenate along the ``time`` dimension.
+"""
+
+# --- stdlib & third-party ----------------------------------------------------
+import numpy as np
+import pandas as pd
+from tqdm import tqdm
+import h5py
+
+import os
+import argparse
+import torch
+import torch.distributed as dist
+
+# -----------------------------------------------------------------------------
+# 0.  Decide which backend to use
+# -----------------------------------------------------------------------------
+#
+# Priority (highest → lowest)
+#   1. --backend argument   (python examples/assess_bias.py --backend nccl)
+#   2. E2_BACKEND env var   (export E2_BACKEND=gloo)
+#   3. Automatic:
+#        - “nccl” if GPUs are visible *and* NCCL is available
+#        - otherwise “gloo”
+#
+parser = argparse.ArgumentParser(add_help=False)
+parser.add_argument("--backend", choices=("nccl", "gloo"), default=None)
+cli, _ = parser.parse_known_args()
+
+backend = (cli.backend or
+           os.getenv("E2_BACKEND") or
+           ("nccl" if torch.cuda.is_available() and dist.is_nccl_available()
+            else "gloo"))
+
+# If the auto-choice is Gloo we are done.
+# If the user *forced* Gloo, we still respect that.
+if backend == "gloo":
+    import physicsnemo.distributed.manager as _pnemo_dm
+    _pnemo_dm.DistributedManager.get_available_backend = staticmethod(lambda: "gloo")
+
+# ---------------------------------------------------------------------------
+# Force PhysicsNemo to pick Gloo backend (avoid NCCL failure on WSL)
+# ---------------------------------------------------------------------------
+import physicsnemo.distributed.manager as _pnemo_dm
+_pnemo_dm.DistributedManager.get_available_backend = staticmethod(lambda: "gloo")
+
+from torch.nn import functional as F
+
+# --- earth2studio / physicsnemo --------------------------------------------
+from physicsnemo.distributed import DistributedManager
+from earth2studio.utils.coords import map_coords
+from earth2studio.utils.time import to_time_array
+from earth2studio.data import fetch_data, ARCO
+from earth2studio.models.px import SFNO
+
+# ---------------------------------------------------------------------------
+# 1. Distributed initialisation
+# ---------------------------------------------------------------------------
+
+DistributedManager.initialize()  # backend comes from env var above
+dm = DistributedManager()           # helper exposing rank, world_size, device
+device = dm.device                  # e.g. "cuda:0", "cuda:1", …
+
+torch.cuda.set_device(device)
+assert torch.cuda.current_device() == device.index if isinstance(device, torch.device) else int(str(device).split(":")[-1])  # type: ignore[arg-type]
+
+
+# Variables to analyze (indices in the model output)
+var_indices = [0, 1, 4, 7]  # easily configurable
+var_indices = list(range(0,20))
+n_vars = len(var_indices)
+# ---------------------------------------------------------------------------
+# 2. Load ERA-5 reference field onto *this* GPU
+# ---------------------------------------------------------------------------
+
+def load_era5_on(dev: torch.device) -> torch.Tensor:
+    """Return ERA-5 tensor (8760, 64, 128) resident on *dev*."""
+    path = "/mnt/e/data/ERA5_h5/r64x128_75v/2010_lr.h5"
+    with h5py.File(path, "r") as f:
+        cpu_arr = f["fields"][:, var_indices]          # numpy array on host (float32)
+    return torch.as_tensor(cpu_arr, dtype=torch.float32, device=dev)
+
+# --- broadcast x_era5 --------------------------------------------------------
+#if dm.rank == 0:
+x_era5 = load_era5_on(device)
+# else:
+#     # create empty tensor with the same shape to receive broadcast
+#     x_era5 = torch.empty((8760, n_vars, 64, 128), dtype=torch.float32, device=device)
+
+
+
+# # Broadcast only if we have more than one rank and torch.distributed is initialized
+# if dm.world_size > 1:
+#     if not dist.is_initialized():
+#         # Initialize a default process group so broadcast works (CPU backend is fine)
+#         dist.init_process_group(backend=backend, rank=dm.rank, world_size=dm.world_size)
+#     dist.broadcast(x_era5, src=0)
+
+x_era5_std = x_era5[0::6].std(dim=[0])
+x_era5_mean = x_era5[0::6].mean(dim=[0])
+
+# ---------------------------------------------------------------------------
+# 3. Model & data source
+# ---------------------------------------------------------------------------
+from earth2studio.models.auto import Package
+#package = SFNO.load_default_package()
+package = Package(root="/mnt/e/checkpoints/HENS/hens_model_registry/sfno_linear_74chq_sc2_layers8_edim620_wstgl2-epoch70_seed12/")
+
+px = SFNO.load_model(package).to(device)
+model_ic = px.input_coords()  # variable & lead_time descriptors
+
+data_src = ARCO()
+
+# ---------------------------------------------------------------------------
+# 4. Time coordinates and sharding
+# ---------------------------------------------------------------------------
+full_time = pd.date_range(start="2010-01-01", end="2010-01-04 18:00:00", freq="6h")
+full_time = to_time_array(full_time)
+
+# Number of prognostic steps (6-hour increments * 360 = 90 days)
+nsteps = 360
+
+time_shards = np.array_split(full_time, dm.world_size)
+my_times = time_shards[dm.rank]
+assert len(my_times) > 0, "Each rank should receive at least one initial time."
+
+# ---------------------------------------------------------------------------
+# 5. Allocate result buffers (local to this rank)
+# ---------------------------------------------------------------------------
+
+
+mbias = torch.empty((nsteps + 1, n_vars, 64, 128), device=device)
+
+# Outlier detection at different sigma levels
+sigma_levels = [2, 4, 6, 8]
+mout = {sigma: torch.empty((nsteps + 1, n_vars, 64, 128), device=device) for sigma in sigma_levels}
+
+gbias = torch.empty((nsteps + 1, n_vars, len(my_times)), device=device)
+
+# Running mean helper
+n_samples = torch.zeros((nsteps + 1,), device=device)
+
+# ---------------------------------------------------------------------------
+# 6. Main inference loop
+# ---------------------------------------------------------------------------
+for t_idx, t_val in enumerate(my_times):
+    era5_offset = int(((t_val - full_time[0]) / np.timedelta64(1, "h")))
+
+    # Fetch initial state from data source
+    x0, coords0 = fetch_data(
+        source=data_src,
+        time=np.asarray([t_val]),
+        variable=model_ic["variable"],
+        lead_time=model_ic["lead_time"],
+        device=device,
+    )
+
+    # Map coordinates to model grid if necessary
+    x0, coords0 = map_coords(x0, coords0, px.input_coords())
+
+    # Prognostic iterator
+    iterator = px.create_iterator(x0, coords0)
+
+    desc = f"rank {dm.rank}  t={str(t_val)}"
+    with tqdm(total=nsteps + 1, desc=desc, position=dm.rank) as pbar:
+        for step, (x_step, coords_step) in enumerate(iterator):
+            # Interpolate to ERA-5 grid & compute bias
+            xi = F.interpolate(x_step[0, :, var_indices], size=(64, 128), mode="area")
+            bias = xi[0] - x_era5[era5_offset + step * 6]
+            
+            # Compute outliers for all sigma levels
+            outliers = {}
+            for sigma in sigma_levels:
+                outliers[sigma] = ((xi[0] > x_era5_mean + sigma*x_era5_std) | 
+                                 (xi[0] < x_era5_mean - sigma*x_era5_std)).to(torch.float32)
+             
+            gbias[step, :, t_idx] = bias.mean(dim=[1,2])
+            n_samples[step] += 1
+            mbias[step] += (bias - mbias[step]) / n_samples[step]
+            
+            # Update running means for all outlier levels
+            for sigma in sigma_levels:
+                mout[sigma][step] += (outliers[sigma] - mout[sigma][step]) / n_samples[step]
+
+            pbar.update(1)
+            if step == nsteps:
+                break
+
+# Ensure all GPU operations are complete before cleanup
+torch.cuda.synchronize()
+del px
+torch.cuda.empty_cache()
+print(f"Rank {dm.rank} finished {len(my_times)} initial times.")
+
+# ---------------------------------------------------------------------------
+# 7. Combine results across ranks
+# ---------------------------------------------------------------------------
+root = 0
+mbias_cpu = mbias.to('cpu', non_blocking=True)
+gbias_cpu = gbias.to('cpu', non_blocking=True)
+
+# Transfer outlier data to CPU
+mout_cpu = {sigma: mout[sigma].to('cpu', non_blocking=True) for sigma in sigma_levels}
+
+# gather_object for my_times length info
+lens = [None] * dm.world_size        # ✔ 2 slots in a 2-GPU run
+dist.gather_object(len(my_times),object_gather_list=lens if dm.rank==root else None, dst=root)
+if dm.rank == root:
+    weights = np.array(lens)/sum(lens)
+
+# Example of sequential gathering using send/recv (commented out)
+# This reduces memory usage on root by processing one rank at a time
+
+# Synchronize all ranks before starting communication
+dist.barrier()
+print(f"Rank {dm.rank}: All ranks synchronized, starting communication...")
+
+if dm.rank == root:
+    print("Starting sequential gathering with send/recv...")
+    
+    # Initialize with root's own data
+    times_list = [my_times]
+    gbias_list = [gbias_cpu]
+    #mbias_g = mbias_cpu.clone()*weights[0]
+    mbias_g = mbias_cpu
+    mbias_g *= weights[0]  # In-place operation - keeps same object
+    #mbias_g = mbias_cpu.clone()
+    #mout_g = {sigma: mout_cpu[sigma].clone() for sigma in sigma_levels}
+
+    # Create aliases for mout_g and apply weights in-place
+    mout_g = {}
+    for sigma in sigma_levels:
+        mout_g[sigma] = mout_cpu[sigma]  # Same object
+        mout_g[sigma] *= weights[0]      # In-place operation - keeps same object
+    
+    # Gather from each other rank sequentially
+    for source_rank in range(1, dm.world_size):
+        print(f"Receiving from rank {source_rank}...")
+        
+        # Receive data using point-to-point communication
+        # Note: recv() requires pre-allocated tensors
+        rank_times = torch.empty(lens[source_rank], dtype=torch.int64)
+        dist.recv(rank_times, src=source_rank, tag=100)
+        rank_times = rank_times.numpy().astype('datetime64[ns]')  # Convert back to numpy datetime
+        
+        rank_gbias = torch.empty((nsteps + 1, n_vars, lens[source_rank]), dtype=torch.float32)
+        dist.recv(rank_gbias, src=source_rank, tag=101)
+        
+        rank_mbias = torch.empty((nsteps + 1, n_vars, 64, 128), dtype=torch.float32)
+        dist.recv(rank_mbias, src=source_rank, tag=102)
+        
+        rank_mout = {}
+        for sigma in sigma_levels:
+            rank_mout[sigma] = torch.empty((nsteps + 1, n_vars, 64, 128), dtype=torch.float32)
+            dist.recv(rank_mout[sigma], src=source_rank, tag=200+sigma)
+        
+        # Process and accumulate
+        times_list.append(rank_times)
+        gbias_list.append(rank_gbias)
+        
+        # Update running weighted averages for mbias and mout only
+        # Use pre-calculated weights based on sample counts
+        for sigma in sigma_levels:
+            mout_g[sigma] += rank_mout[sigma]*weights[source_rank]  # In-place addition
+        mbias_g += rank_mbias*weights[source_rank]  # In-place addition
+        
+        # Free memory immediately
+        del rank_mbias, rank_gbias, rank_mout, rank_times
+        print(f"Processed rank {source_rank}, memory freed")
+    
+    # Final assembly
+    times_g = np.concatenate(times_list)
+    gbias_g = torch.concatenate(gbias_list, dim=2)
+    print("Sequential gathering completed!")
+
+else:
+    # Non-root ranks send their data (recv operations naturally wait for this)
+    print(f"Rank {dm.rank} sending data to root...")
+    
+    # Convert times to tensor for sending
+    times_tensor = torch.from_numpy(my_times.view('int64'))
+    dist.send(times_tensor, dst=root, tag=100)
+    
+    dist.send(gbias_cpu, dst=root, tag=101)
+    dist.send(mbias_cpu, dst=root, tag=102)
+    for sigma in sigma_levels:
+        dist.send(mout_cpu[sigma], dst=root, tag=200+sigma)
+    print(f"Rank {dm.rank} data sent")
+
+
+# # Standard parallel gathering (current approach)
+# mbias_cpu_list = [None] * dm.world_size
+# dist.gather_object(mbias_cpu,object_gather_list=mbias_cpu_list if dm.rank==root else None, dst=root)
+# gbias_cpu_list = [None] * dm.world_size
+# dist.gather_object(gbias_cpu,object_gather_list=gbias_cpu_list if dm.rank==root else None, dst=root)
+# my_times_list = [None] * dm.world_size
+# dist.gather_object(my_times,object_gather_list=my_times_list if dm.rank==root else None, dst=root)
+
+# # Gather outlier data for all sigma levels
+# mout_cpu_list = {}
+# for sigma in sigma_levels:
+#     mout_cpu_list[sigma] = [None] * dm.world_size
+#     dist.gather_object(mout_cpu[sigma], object_gather_list=mout_cpu_list[sigma] if dm.rank==root else None, dst=root)
+
+
+if dm.rank == root:
+    # print(1)
+    # times_g = np.concatenate(my_times_list)
+    # #weights = np.array(lens)/sum(lens)
+    # mbias_g2 = torch.zeros_like(mbias_cpu_list[0])
+    
+    # # Initialize weighted averages for outlier data
+    # mout_g2 = {sigma: torch.zeros_like(mout_cpu_list[sigma][0]) for sigma in sigma_levels}
+    
+    # for i in range(len(lens)):
+    #     mbias_g2 += mbias_cpu_list[i] * weights[i]
+        
+    #     # Weighted average for all sigma levels
+    #     for sigma in sigma_levels:
+    #         mout_g2[sigma] += mout_cpu_list[sigma][i] * weights[i]
+
+    # gbias_g = torch.concatenate(gbias_cpu_list,dim=1)
+     
+    # Build save dictionary dynamically
+    save_dict = {
+        "mbias": mbias_g, 
+        "gbias": gbias_g, 
+        "times": times_g,
+        "sigma_levels": sigma_levels,
+        "var_indices": var_indices,
+        "x_era5_mean": x_era5_mean.cpu(),
+        "x_era5_std": x_era5_std.cpu()
+    }
+    
+    # Add outlier data with descriptive keys
+    for sigma in sigma_levels:
+        save_dict[f"mout{sigma}"] = mout_g[sigma]
+    
+    torch.save(save_dict, "all_bias.pt")
