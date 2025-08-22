@@ -116,6 +116,25 @@ class ZarrBackend:
         return self.root.__iter__()
 
     # sphinx - io zarr end
+    def _normalize_time_like(
+        self, values: Any, target_dtype: np.dtype | None = None
+    ) -> np.ndarray:
+        """Normalize time-like arrays/scalars.
+
+        - numpy timedelta64 → int64 seconds
+        - numpy datetime64 → int64 nanoseconds since epoch
+        Optionally cast to target_dtype if provided and safe.
+        """
+        v = np.asarray(values)
+        if np.issubdtype(v.dtype, np.timedelta64):
+            v = (v / np.timedelta64(1, "s")).astype(np.int64)
+        elif np.issubdtype(v.dtype, np.datetime64):
+            v = v.astype("datetime64[ns]").astype(np.int64)
+        if target_dtype is not None and v.dtype != target_dtype:
+            if np.can_cast(v.dtype, target_dtype, casting="safe"):
+                v = v.astype(target_dtype, copy=False)
+        return v
+
     def add_array(
         self,
         coords: CoordSystem,
@@ -159,6 +178,8 @@ class ZarrBackend:
         adjusted_coords, mapping = convert_multidim_to_singledim(coords)
 
         for dim, values in adjusted_coords.items():
+            values = self._normalize_time_like(values)
+            adjusted_coords[dim] = values
             if dim not in self.coords:
                 if "compressors" not in kwargs:
                     kwargs["compressors"] = self.zarr_codecs
@@ -273,7 +294,14 @@ class ZarrBackend:
                 self.root[name][
                     np.ix_(
                         *[
-                            np.where(np.isin(self.coords[dim], value))[0]
+                            np.where(
+                                np.isin(
+                                    self.coords[dim],
+                                    self._normalize_time_like(
+                                        value, target_dtype=self.coords[dim].dtype
+                                    ),
+                                )
+                            )[0]
                             for dim, value in adjusted_coords.items()
                         ]
                     )
@@ -318,7 +346,14 @@ class ZarrBackend:
         x = self.root[array_name][
             np.ix_(
                 *[
-                    np.where(np.isin(self.coords[dim], value))[0]
+                    np.where(
+                        np.isin(
+                            self.coords[dim],
+                            self._normalize_time_like(
+                                value, target_dtype=self.coords[dim].dtype
+                            ),
+                        )
+                    )[0]
                     for dim, value in adjusted_coords.items()
                 ]
             )

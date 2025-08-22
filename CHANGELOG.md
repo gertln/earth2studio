@@ -25,6 +25,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Normalize datetime64/timedelta64 coordinates in Zarr IO to numeric types for
+  consistent creation and selection with Zarr 3.0.
+
 ### Security
 
 ### Dependencies
